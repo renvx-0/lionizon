@@ -201,6 +201,7 @@ if (/roblox\.\w+\/my\/account/.test(window.location.href)) {
 
             await dropdownBuilder("Home welcome banner", "Enabled", settings, "home_banner_enabled", ["Enabled", "Disabled"])
             await dropdownBuilder("User presence circles", "Enabled", settings, "user_presence_circles", ["Enabled", "Disabled"])
+            await dropdownBuilder("User game presence thumbnail preview", "Enabled", settings, "game_presence_thumbnail_preview", ["Enabled", "Disabled"])
 
             tabcontent.insertAdjacentHTML("beforeend", `
             <div class="container-header">

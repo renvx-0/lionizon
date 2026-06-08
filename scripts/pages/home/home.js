@@ -5,10 +5,10 @@
         return n.toString();
     }
 
-    const saved_settings = await loadData("lionizon_settings", { home_banner_enabled: true, user_presence_circles: true })
+    const saved_settings = await loadData("lionizon_settings", { home_banner_enabled: "Enabled", user_presence_circles: "Enabled", game_presence_thumbnail_preview: "Enabled" })
     await saveData({ lionizon_settings: saved_settings })
 
-    if (window.location.href.includes("/home") || window.location.href.includes("/friends") || (window.location.href.includes("/users") && saved_settings.user_presence_circles)) {
+    if (window.location.href.includes("/home") || window.location.href.includes("/friends") || (window.location.href.includes("/users"))) {
 
         const previousStates = new Map() // userId -> currentGame
         const observedTiles = new Set()
@@ -33,11 +33,13 @@
                     previousStates.set(userId, currentGame)
 
                     const image_card = card.querySelector(".avatar-card-image")
-                    if (image_card) {
-                        if (user_status == "game") image_card.style.border = "solid 3px #02b757"
-                        else if (user_status == "online") image_card.style.border = "solid 3px #00a2ff"
-                        else if (user_status == "studio") image_card.style.border = "solid 3px #f68802"
-                        else image_card.style.border = "none"
+                    if (saved_settings.user_presence_circles === "Enabled") {
+                        if (image_card) {
+                            if (user_status == "game") image_card.style.border = "solid 3px #02b757"
+                            else if (user_status == "online") image_card.style.border = "solid 3px #00a2ff"
+                            else if (user_status == "studio") image_card.style.border = "solid 3px #f68802"
+                            else image_card.style.border = "none"
+                        }
                     }
 
                     if (user_status !== "game") return;
@@ -52,6 +54,14 @@
                     let serverId = presence.gameId
                     let placeId = presence.placeId
                     let universeId = presence.universeId
+ 
+                    if (saved_settings.game_presence_thumbnail_preview === "Enabled") {
+                        let placeThumbnail = await getPlaceIdThumbnail(placeId)
+                        const avatar_status = card.querySelector(".avatar-status")
+                        avatar_status.insertAdjacentHTML("afterend", `
+                            <img src="${placeThumbnail}" style="position: absolute; height: 28px; right: 0; bottom: 0; border-radius: 7px;">
+                        `)
+                    }
 
                     const tile = card.closest(".friends-carousel-tile") ?? card.closest(".avatar-card-content")
                     if (tile && !observedTiles.has(tile)) {
@@ -145,7 +155,7 @@
         let banner_created = false;
         const banner_observer = new MutationObserver(async () => {
             const content = document.querySelector("#HomeContainer");
-            if (content && !content.querySelector("#profile-view-banner") && !banner_created && saved_settings.home_banner_enabled) {
+            if (content && !content.querySelector("#profile-view-banner") && !banner_created && saved_settings.home_banner_enabled === "Enabled") {
                 banner_created = true;
                 const userId = await getLoggedInUserId();
                 const displayName = await getLoggedInUserDisplay();
