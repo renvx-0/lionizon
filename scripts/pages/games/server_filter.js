@@ -38,11 +38,12 @@ async function getAllServersCached(pageGameId) {
 async function renderServerCards(sorted, pageGameId) {
     const container = document.querySelector("#rbx-public-game-server-item-container");
 
-    const plr_thumbnails = await getUsersThumbnailFromTokens(sorted.flatMap(s => s.playerTokens));
-    let tidx = 0;
+    // Map keyed by playerToken -> imageUrl. Avoids the positional-slice bug
+    // where out-of-order/dropped batch results silently dropped avatars.
+    const thumbByToken = await getUsersThumbnailFromTokens(sorted.flatMap(s => s.playerTokens || []));
+
     const serverThumbs = Object.fromEntries(sorted.map(s => {
-        const thumbs = plr_thumbnails.slice(tidx, tidx + s.playerTokens.length).map(t => t.imageUrl);
-        tidx += s.playerTokens.length;
+        const thumbs = (s.playerTokens || []).map(t => thumbByToken[t]).filter(Boolean);
         return [s.id, thumbs];
     }));
 

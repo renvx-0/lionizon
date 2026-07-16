@@ -220,8 +220,13 @@ async function getUsersThumbnailFromTokens(tokens) {
     for (let i = 0; i < tokens.length; i += 100)
         chunks.push(tokens.slice(i, i + 100));
 
-    const results = await Promise.all(chunks.map(async chunk => {
-        let data
+    // Return a { [playerToken]: imageUrl } map instead of an ordered array.
+    // The batch endpoint echoes each request's `token` back, so we can assign
+    // thumbnails to the correct server without relying on response ordering
+    // (which is the bug that made avatars disappear on filtered/region lists).
+    const maps = await Promise.all(chunks.map(async chunk => {
+        const map = {};
+        let data;
         while (true) {
             const r = await fetch(`https://thumbnails.roblox.com/v1/batch`, {
                 method: "POST",
@@ -240,10 +245,14 @@ async function getUsersThumbnailFromTokens(tokens) {
             data = await r.json();
             break
         }
-        return data.data;
+        for (const item of (data.data || [])) {
+            const token = item.token ?? (item.requestId ? item.requestId.split(":")[1] : null);
+            if (token != null && item.imageUrl) map[token] = item.imageUrl;
+        }
+        return map;
     }));
 
-    return results.flat();
+    return Object.assign({}, ...maps);
 }
 
 async function joinInstanceInfo(placeId, serverIds) {

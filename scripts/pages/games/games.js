@@ -5,6 +5,25 @@ const IP_API_URL = "https://api-geolocation.juliozapatahernandez2006.workers.dev
 const locationCache = {};
 const locationResolvers = {};
 
+// -- DEBUG ONLY: collect every server IP we encounter (handy for checking which
+// IP ranges show up vs what's in ServerList.json). Call `dumpServerIps()` in the
+// devtools console to download them as a plain .txt. No effect on normal use. --
+const __debugServerIps = new Set();
+window.dumpServerIps = () => {
+    const text = Array.from(__debugServerIps).join("\n");
+    const blob = new Blob([text], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "server_ips.txt";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    log(`Dumped ${__debugServerIps.size} server IPs to server_ips.txt`);
+};
+
 // fires when server data found
 function resolveLocation(serverId, value) {
     locationCache[serverId] = value;
