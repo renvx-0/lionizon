@@ -54,13 +54,16 @@
                     let serverId = presence.gameId
                     let placeId = presence.placeId
                     let universeId = presence.universeId
- 
-                    if (saved_settings.game_presence_thumbnail_preview === "Enabled" && placeId) {
+                    
+                    if (saved_settings.game_presence_thumbnail_preview === "Enabled") {
                         let placeThumbnail = await getPlaceIdThumbnail(placeId)
                         const avatar_status = card.querySelector(".avatar-status")
-                        avatar_status.insertAdjacentHTML("afterend", `
-                            <img src="${placeThumbnail}" class=".game-presence-preview" style="position: absolute; height: 28px; right: 0; bottom: 0; border-radius: 7px;">
-                        `)
+                        avatar_status.parentElement.querySelector(".game-presence-preview")?.remove()
+                        if (placeId) {
+                            avatar_status.insertAdjacentHTML("afterend", `
+                                <img src="${placeThumbnail}" class=".game-presence-preview" style="position: absolute; height: 28px; right: 0; bottom: 0; border-radius: 7px;">
+                            `)
+                        }
                     }
 
                     const tile = card.closest(".friends-carousel-tile") ?? card.closest(".avatar-card-content")
