@@ -20,73 +20,23 @@ let originalHTML = null;
 let originalServerList = null;
 let loadMoreBtnClone = null;
 
-async function applyServerFilter(filter_mode) {
+// Cache the expensive "all servers" fetch per game page so the performant
+// filter and the region selector don't each re-download the entire list.
+let _cachedServers = null;
+let _cachedServersGameId = null;
+
+async function getAllServersCached(pageGameId) {
+    if (_cachedServers && _cachedServersGameId === pageGameId) return _cachedServers;
+    _cachedServers = await getAllServers(pageGameId);
+    _cachedServersGameId = pageGameId;
+    return _cachedServers;
+}
+
+// Render an ordered list of servers into the server container, attaching the
+// "load more" clone button and per-card geolocation. Shared by every filter
+// mode so the performant sort and the region selector produce identical cards.
+async function renderServerCards(sorted, pageGameId) {
     const container = document.querySelector("#rbx-public-game-server-item-container");
-    if (!container) return;
-
-    if (filter_mode === "default") {
-        window.__filter_active__ = false;
-        window.server_list = originalServerList ?? [];
-        container.innerHTML = originalHTML;
-        loadMoreBtnClone?.remove();
-        document.querySelector(".rbx-public-running-games-footer").style.removeProperty("display");
-        originalHTML = null;
-        originalServerList = null;
-        return;
-    }
-
-    if (window.__filter_active__) return;
-    window.__filter_active__ = true;
-
-    const pageGameId = parseInt(window.location.href.split("games/")[1].split("/")[0]);
-
-    document.body.insertAdjacentHTML("beforeend", `
-    <div class="foundation-web-dialog-overlay padding-y-medium foundation-web-portal-zindex bg-common-backdrop">
-        <div role="dialog" class="relative radius-large bg-surface-100 stroke-none foundation-web-dialog-content shadow-transient-high download-dialog" data-size="Medium">
-            
-            <!-- Close button -->
-            <div class="absolute foundation-web-dialog-close-container">
-                <button type="button" class="foundation-web-close-affordance flex bg-none cursor-pointer bg-over-media-100 padding-small radius-circle stroke-none" aria-label="Close">
-                    <span class="icon icon-regular-x size-[var(--icon-size-medium)]"></span>
-                </button>
-            </div>
-
-            <!-- Icon + Title -->
-            <div class="dialog-main-container padding-x-xlarge padding-top-xlarge padding-bottom-xlarge flex flex-col items-center gap-xlarge">
-                <img src="${chrome.runtime.getURL('assets/icons/cat128.png')}" class="app-icon-windows size-1600">
-                <h2 class="text-heading-small padding-x-xxlarge text-align-x-center">
-                    Fetching servers with ${filter_mode} mode. 
-                    Please be patient...
-                </h2>
-            </div>
-
-            <div class="dialog-button-container padding-x-xlarge padding-bottom-xlarge flex">
-                <button type="button" class="foundation-web-button cursor-pointer flex items-center justify-center radius-medium text-label-medium height-1000 padding-x-medium bg-action-emphasis content-action-emphasis grow stroke-none" style="background-color: #dfa834">
-                    <div aria-hidden="true" class="absolute flex"><svg class="foundation-web-loading-spinner" width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" fill="currentColor" d="M10 2.75C8.56609 2.75 7.16438 3.1752 5.97212 3.97185C4.77986 4.76849 3.85061 5.90078 3.30188 7.22554C2.75314 8.55031 2.60957 10.008 2.88931 11.4144C3.16905 12.8208 3.85955 14.1126 4.87348 15.1265C5.88741 16.1405 7.17924 16.831 8.5856 17.1107C9.99196 17.3904 11.4497 17.2469 12.7745 16.6981C14.0992 16.1494 15.2315 15.2201 16.0282 14.0279C16.8248 12.8356 17.25 11.4339 17.25 10C17.25 9.58579 17.5858 9.25 18 9.25C18.4142 9.25 18.75 9.58579 18.75 10C18.75 11.7306 18.2368 13.4223 17.2754 14.8612C16.3139 16.3002 14.9473 17.4217 13.3485 18.0839C11.7496 18.7462 9.9903 18.9195 8.29296 18.5819C6.59563 18.2443 5.03653 17.4109 3.81282 16.1872C2.58911 14.9635 1.75575 13.4044 1.41813 11.707C1.08051 10.0097 1.25379 8.25037 1.91606 6.65152C2.57832 5.05267 3.69983 3.6861 5.13876 2.72464C6.57769 1.76318 8.26942 1.25 10 1.25C10.4142 1.25 10.75 1.58579 10.75 2C10.75 2.41421 10.4142 2.75 10 2.75Z"></path></svg></div>
-                </button>
-            </div>
-
-        </div>
-    </div>
-    `)
-    const searchingDialog = document.querySelector(".foundation-web-dialog-overlay")
-
-    if (!originalHTML) {
-        originalHTML = container.innerHTML;
-        originalServerList = [...window.server_list];
-    }
-
-    const data = await getAllServers(pageGameId)
-
-    const seen = new Set();
-    let sorted
-    if (filter_mode == "performant") {
-        sorted = performantSort(data.server_list ?? []).filter(s => {
-            if (seen.has(s.id)) return false;
-            seen.add(s.id);
-            return true;
-        });
-    }
 
     const plr_thumbnails = await getUsersThumbnailFromTokens(sorted.flatMap(s => s.playerTokens));
     let tidx = 0;
@@ -99,8 +49,10 @@ async function applyServerFilter(filter_mode) {
     container.innerHTML = "";
 
     let loadMoreBtn = document.querySelector(".rbx-public-running-games-footer");
-    loadMoreBtnClone = loadMoreBtn.cloneNode(true);
-    loadMoreBtnClone.classList.add("cloned-btn")
+    if (!loadMoreBtnClone) {
+        loadMoreBtnClone = loadMoreBtn.cloneNode(true);
+        loadMoreBtnClone.classList.add("cloned-btn");
+    }
     loadMoreBtn.style.display = "none";
 
     let current_shown_idx = 0;
@@ -175,12 +127,115 @@ async function applyServerFilter(filter_mode) {
         if (current_shown_idx >= sorted.length) loadMoreBtnClone.style.display = "none";
     }
 
-    searchingDialog.remove()
-
     loadNextBatch(); // first batch
 
     loadMoreBtnClone.addEventListener("click", loadNextBatch);
     container.after(loadMoreBtnClone);
+}
+
+async function applyServerFilter(filter_mode) {
+    const container = document.querySelector("#rbx-public-game-server-item-container");
+    if (!container) return;
+
+    // Reset to Roblox's default behaviour.
+    if (filter_mode === "default") {
+        window.__filter_active__ = false;
+        window.__current_filter__ = "default";
+        window.server_list = originalServerList ?? [];
+        container.innerHTML = originalHTML;
+        loadMoreBtnClone?.remove();
+        loadMoreBtnClone = null;
+        document.querySelector(".rbx-public-running-games-footer")?.style.removeProperty("display");
+        originalHTML = null;
+        originalServerList = null;
+        return;
+    }
+
+    // Already showing this exact mode – don't re-run the (expensive) search.
+    if (window.__filter_active__ && window.__current_filter__ === filter_mode) return;
+
+    // Switching from another active mode: restore the baseline list first so
+    // the new render starts clean. originalHTML/originalServerList are kept so
+    // a later "default" still works.
+    if (window.__filter_active__) {
+        window.__filter_active__ = false;
+        container.innerHTML = originalHTML;
+        loadMoreBtnClone?.remove();
+        loadMoreBtnClone = null;
+        document.querySelector(".rbx-public-running-games-footer")?.style.removeProperty("display");
+        window.server_list = originalServerList ?? [];
+    }
+
+    window.__filter_active__ = true;
+    window.__current_filter__ = filter_mode;
+
+    const pageGameId = parseInt(window.location.href.split("games/")[1].split("/")[0]);
+
+    const dialogLabel = filter_mode === "performant"
+        ? "Fetching servers by performance, please be patient..."
+        : "Filtering servers by region, please be patient...";
+
+    document.body.insertAdjacentHTML("beforeend", `
+    <div class="foundation-web-dialog-overlay padding-y-medium foundation-web-portal-zindex bg-common-backdrop">
+        <div role="dialog" class="relative radius-large bg-surface-100 stroke-none foundation-web-dialog-content shadow-transient-high download-dialog" data-size="Medium">
+            
+            <!-- Close button -->
+            <div class="absolute foundation-web-dialog-close-container">
+                <button type="button" class="foundation-web-close-affordance flex bg-none cursor-pointer bg-over-media-100 padding-small radius-circle stroke-none" aria-label="Close">
+                    <span class="icon icon-regular-x size-[var(--icon-size-medium)]"></span>
+                </button>
+            </div>
+
+            <!-- Icon + Title -->
+            <div class="dialog-main-container padding-x-xlarge padding-top-xlarge padding-bottom-xlarge flex flex-col items-center gap-xlarge">
+                <img src="${chrome.runtime.getURL('assets/icons/cat128.png')}" class="app-icon-windows size-1600">
+                <h2 class="text-heading-small padding-x-xxlarge text-align-x-center">
+                    ${dialogLabel}
+                </h2>
+            </div>
+
+            <div class="dialog-button-container padding-x-xlarge padding-bottom-xlarge flex">
+                <button type="button" class="foundation-web-button cursor-pointer flex items-center justify-center radius-medium text-label-medium height-1000 padding-x-medium bg-action-emphasis content-action-emphasis grow stroke-none" style="background-color: #dfa834">
+                    <div aria-hidden="true" class="absolute flex"><svg class="foundation-web-loading-spinner" width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" fill="currentColor" d="M10 2.75C8.56609 2.75 7.16438 3.1752 5.97212 3.97185C4.77986 4.76849 3.85061 5.90078 3.30188 7.22554C2.75314 8.55031 2.60957 10.008 2.88931 11.4144C3.16905 12.8208 3.85955 14.1126 4.87348 15.1265C5.88741 16.1405 7.17924 16.831 8.5856 17.1107C9.99196 17.3904 11.4497 17.2469 12.7745 16.6981C14.0992 16.1494 15.2315 15.2201 16.0282 14.0279C16.8248 12.8356 17.25 11.4339 17.25 10C17.25 9.58579 17.5858 9.25 18 9.25C18.4142 9.25 18.75 9.58579 18.75 10C18.75 11.7306 18.2368 13.4223 17.2754 14.8612C16.3139 16.3002 14.9473 17.4217 13.3485 18.0839C11.7496 18.7462 9.9903 18.9195 8.29296 18.5819C6.59563 18.2443 5.03653 17.4109 3.81282 16.1872C2.58911 14.9635 1.75575 13.4044 1.41813 11.707C1.08051 10.0097 1.25379 8.25037 1.91606 6.65152C2.57832 5.05267 3.69983 3.6861 5.13876 2.72464C6.57769 1.76318 8.26942 1.25 10 1.25C10.4142 1.25 10.75 1.58579 10.75 2C10.75 2.41421 10.4142 2.75 10 2.75Z"></path></svg></div>
+                </button>
+            </div>
+
+        </div>
+    </div>
+    `)
+    const searchingDialog = document.querySelector(".foundation-web-dialog-overlay")
+
+    if (!originalHTML) {
+        originalHTML = container.innerHTML;
+        originalServerList = [...window.server_list];
+    }
+
+    const data = await getAllServersCached(pageGameId)
+
+    let sorted = [];
+    if (filter_mode === "performant") {
+        const seen = new Set();
+        sorted = performantSort(data.server_list ?? []).filter(s => {
+            if (seen.has(s.id)) return false;
+            seen.add(s.id);
+            return true;
+        });
+    } else if (filter_mode.startsWith("region:")) {
+        const raw = filter_mode.split(":")[1];
+        const all = data.server_list ?? [];
+        // Make sure every server is geolocated before we can read its country.
+        processServersLocationBatch(all, pageGameId);
+        await Promise.all(all.map(s => waitForLocation(s.id, 15000).catch(() => null)));
+        if (raw === "__unknown__") {
+            sorted = all.filter(s => !locationCache[s.id] || !locationCache[s.id].country);
+        } else {
+            sorted = all.filter(s => locationCache[s.id]?.country === raw);
+        }
+    }
+
+    searchingDialog.remove()
+
+    await renderServerCards(sorted, pageGameId);
 }
 
 if (window.location.href.includes("/games/")) {

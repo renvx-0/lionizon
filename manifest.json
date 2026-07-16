@@ -42,6 +42,7 @@
         "scripts/pages/general/settings.js",
         "scripts/pages/general/robux_to_currency.js",
         "scripts/pages/games/server_filter.js",
+        "scripts/pages/games/region_filter.js",
         "scripts/pages/catalog/40_method.js",
         "scripts/pages/games/random_server.js",
         "scripts/pages/games/badges.js",
