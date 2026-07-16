@@ -60,9 +60,11 @@ let loadMoreBtnClone = null;
 
 // --- Filter composition state -----------------------------------------------
 // The sort mode (performant / ping_server / ping_client / default) and an
-// optional region scope compose: the chosen sort runs over the servers in the
-// selected region only. Region comes from the Region button (region_filter.js);
-// it calls the window helpers below to set scope + re-apply the current sort.
+// optional region scope compose INDEPENDENTLY: the chosen sort runs over the
+// servers in the selected region only. Region comes from the Region button
+// (region_filter.js); it calls the window helpers below to set scope + re-apply
+// the current sort. Neither dropdown resets the other, so a region selection
+// survives a sort change (and vice-versa) and the two filters always stack.
 let _filterRegion = null;          // country code, "__unknown__", or null
 let _activeFilterMode = "default";
 let _activeSortAscending = true;
@@ -77,51 +79,149 @@ window.__reapplyServerFilter = () => {
     applyServerFilter(_activeFilterMode, _activeSortAscending);
 };
 
-// Cache the expensive "all servers" fetch per game page so the performant
-// filter and the region selector don't each re-download the entire list.
-//
-// Before this fix, only an in-memory variable was kept, but applyServerFilter()
-// cleared it back to null on every mode switch (default / performant / ping_*),
-// so each filter change re-fetched the full server list. The cache is now kept
-// in chrome.storage keyed by placeId, so it survives filter changes AND SPA
-// navigations to other games (the script re-runs per /games/ load), and is only
-// refreshed when it's missing or belongs to a different game.
-const _serverCacheKey = "ext_server_cache";
+// --- In-memory server cache (page session only) -----------------------------
+// The expensive "all servers" fetch is kept ONLY in memory for the life of the
+// page/tab. We deliberately do NOT persist it to chrome.storage/localStorage:
+// the first time a filter or the region picker needs the full list we download
+// it once, and every subsequent filter/region change reuses the exact same
+// array instead of re-fetching. The same applies to geolocation (see
+// geolocateAllServersOnce) — once a server is placed, it is never relocated
+// again for this page load.
 let _cachedServers = null;
 let _cachedServersGameId = null;
 
-// Load the persisted cache (or start empty). Seeded once at module load.
-const __serverCachePromise = loadData(_serverCacheKey, {}).then(
-    data => { _serverCache = data; return data; }
-);
-let _serverCache = {};
-
 async function getAllServersCached(pageGameId) {
-    // In-memory hit for this page load.
+    // In-memory hit for this page load — never re-downloads.
     if (_cachedServers && _cachedServersGameId === pageGameId) return _cachedServers;
 
-    // Persistent hit (survives filter changes + SPA nav to the same game).
-    await __serverCachePromise;
-    const stored = _serverCache[pageGameId];
-    if (Array.isArray(stored?.server_list) && stored.server_list.length > 0) {
-        _cachedServers = stored;
-        _cachedServersGameId = pageGameId;
-        return _cachedServers;
-    }
-
-    // Otherwise fetch from the API (only once) and persist it.
+    // Different game (SPA navigation) or first load → fetch once.
     _cachedServers = await getAllServers(pageGameId);
     _cachedServersGameId = pageGameId;
-
-    _serverCache[pageGameId] = _cachedServers;
-    saveData({ [_serverCacheKey]: _serverCache });
-
     return _cachedServers;
+}
+
+// Geolocate every server in the cached list exactly ONCE per page. Concurrent
+// callers share the same pass (returns the same promise), and once it resolves
+// the promise is reused so we never re-relocate servers that are already placed.
+// This is what makes "click region → pick a sort → change region → change sort"
+// feel instant after the first pass instead of relocating everything again.
+let _allGeolocatePromise = null;
+let _allGeolocated = false;
+
+async function ensureAllServers(pageGameId) {
+    if (_cachedServers && _cachedServersGameId === pageGameId) return _cachedServers;
+    // Game changed (or first load): drop any stale single-pass geolocation so
+    // the next geolocateAllServersOnce re-runs for the new game.
+    _allGeolocatePromise = null;
+    _allGeolocated = false;
+    _cachedServers = await getAllServers(pageGameId);
+    _cachedServersGameId = pageGameId;
+    return _cachedServers;
+}
+
+// Listeners captured on the first (heavy) pass only. Subsequent calls return
+// the already-running/instant promise and don't need progress updates.
+let _geolocateProgressListeners = [];
+
+// Geolocate every server in the cached list exactly ONCE per page. Concurrent
+// callers share the same pass (returns the same promise), and once it resolves
+// the promise is reused so we never re-relocate servers that are already placed.
+// This is what makes "click region → pick a sort → change region → change sort"
+// feel instant after the first pass instead of relocating everything again.
+//
+// Pass `onProgress({ phase, done, total })` to get live progress during the
+// first (slow) pass — `phase` is "fetching" or "geolocating", `done`/`total`
+// are the number of servers resolved / total. Used to show the user the work
+// isn't stuck (the region button text + the inline list spinner both consume it).
+function geolocateAllServersOnce(pageGameId, onProgress) {
+    if (onProgress) _geolocateProgressListeners.push(onProgress);
+
+    // Cached / already-resolved pass → nothing to report, just hand back the data.
+    if (_allGeolocatePromise && _cachedServersGameId === pageGameId) return _allGeolocatePromise;
+
+    _allGeolocated = false;
+    const listeners = _geolocateProgressListeners;
+    _geolocateProgressListeners = [];
+    const emit = (phase, done, total) => listeners.forEach(cb => cb({ phase, done, total }));
+
+    _allGeolocatePromise = (async () => {
+        emit("fetching", 0, 0);
+        const data = await ensureAllServers(pageGameId);
+        const all = data.server_list ?? [];
+        const total = all.length;
+
+        // processServersLocationBatch skips any server already in locationCache,
+        // so this only ever does real work the first time.
+        processServersLocationBatch(all, pageGameId);
+
+        let done = 0;
+        emit("geolocating", done, total);
+        // Resolve each server's location; the .then bumps the counter and emits
+        // progress as servers come back (or time out after 15s). Counting every
+        // resolution — success or timeout — keeps "done" marching toward "total"
+        // so the bar never appears frozen even if a handful of servers fail.
+        await Promise.all(all.map(s =>
+            waitForLocation(s.id, 15000)
+                .catch(() => null)
+                .then(() => { done++; emit("geolocating", done, total); })
+        ));
+
+        _allGeolocated = true;
+        return all;
+    })();
+    return _allGeolocatePromise;
+}
+
+// --- Inline loading feedback -------------------------------------------------
+// A lightweight spinner dropped straight into the server list. The heavy
+// fetch+geolocation only happens once (cached), but the *compute* between a
+// click and the cards appearing (especially the client-ping distance sort) can
+// take a couple of seconds on a cached load too. Showing this immediately means
+// a click always gets instant visual feedback and never looks "dead". This
+// replaces the old full-screen cat popup — the spinner lives in the list itself.
+const SERVER_FILTER_SPINNER_SVG =
+    '<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" fill="currentColor" d="M10 2.75C8.56609 2.75 7.16438 3.1752 5.97212 3.97185C4.77986 4.76849 3.85061 5.90078 3.30188 7.22554C2.75314 8.55031 2.60957 10.008 2.88931 11.4144C3.16905 12.8208 3.85955 14.1126 4.87348 15.1265C5.88741 16.1405 7.17924 16.831 8.5856 17.1107C9.99196 17.3904 11.4497 17.2469 12.7745 16.6981C14.0992 16.1494 15.2315 15.2201 16.0282 14.0279C16.8248 12.8356 17.25 11.4339 17.25 10C17.25 9.58579 17.5858 9.25 18 9.25C18.4142 9.25 18.75 9.58579 18.75 10C18.75 11.7306 18.2368 13.4223 17.2754 14.8612C16.3139 16.3002 14.9473 17.4217 13.3485 18.0839C11.7496 18.7462 9.9903 18.9195 8.29296 18.5819C6.59563 18.2443 5.03653 17.4109 3.81282 16.1872C2.58911 14.9635 1.75575 13.4044 1.41813 11.707C1.08051 10.0097 1.25379 8.25037 1.91606 6.65152C2.57832 5.05267 3.69983 3.6861 5.13876 2.72464C6.57769 1.76318 8.26942 1.25 10 1.25C10.4142 1.25 10.75 1.58579 10.75 2C10.75 2.41421 10.4142 2.75 10 2.75Z"></path></svg>';
+
+function showServerFilterSpinner(container, label = "Applying filter…") {
+    container.innerHTML = `
+        <div class="server-filter-inline-spinner">
+            ${SERVER_FILTER_SPINNER_SVG}
+            <span>${label}</span><span class="server-filter-spinner-count"></span>
+        </div>
+    `;
+    return container.querySelector(".server-filter-spinner-count");
+}
+
+// Toggle the "Load more" control while a filter is (re)loading. We hide the
+// original Roblox footer (we always manage the list via our cloned copy) and
+// disable the .rbx-running-games-load-more button (plus the whole clone, so a
+// click anywhere on it is ignored) so the user can't page through a stale list
+// mid-sort. Called with `true` the instant a filter starts loading; the control
+// is re-enabled inside renderServerCards once the new cards are ready.
+function setLoadMoreDisabled(disabled) {
+    const footer = document.querySelector(".rbx-public-running-games-footer");
+    if (footer) footer.style.display = "none";
+
+    if (loadMoreBtnClone) {
+        loadMoreBtnClone.style.pointerEvents = disabled ? "none" : "";
+        loadMoreBtnClone.style.display = disabled ? "none" : "";
+        const cloneInner = loadMoreBtnClone.querySelector(".rbx-running-games-load-more");
+        if (cloneInner) {
+            cloneInner.disabled = disabled;
+            cloneInner.style.pointerEvents = disabled ? "none" : "";
+            cloneInner.style.opacity = disabled ? "0.5" : "";
+        }
+    }
 }
 
 // Render an ordered list of servers into the server container, attaching the
 // "load more" clone button and per-card geolocation. Shared by every filter
 // mode so the performant sort and the region selector produce identical cards.
+// The load-more click handler is REPLACED (not stacked) on every render so
+// repeated filtering doesn't accumulate listeners that each dump another 12
+// servers when the button is clicked.
+let _loadMoreHandler = null;
+
 async function renderServerCards(sorted, pageGameId) {
     const container = document.querySelector("#rbx-public-game-server-item-container");
 
@@ -140,6 +240,7 @@ async function renderServerCards(sorted, pageGameId) {
     if (!loadMoreBtnClone) {
         loadMoreBtnClone = loadMoreBtn.cloneNode(true);
         loadMoreBtnClone.classList.add("cloned-btn");
+        container.after(loadMoreBtnClone);
     }
     loadMoreBtn.style.display = "none";
 
@@ -215,60 +316,68 @@ async function renderServerCards(sorted, pageGameId) {
         if (current_shown_idx >= sorted.length) loadMoreBtnClone.style.display = "none";
     }
 
-    loadNextBatch(); // first batch
+    // Re-enable "Load more" now that the freshly filtered cards are in the DOM
+    // (clearing whatever disabled state was set while loading).
+    setLoadMoreDisabled(false);
 
-    loadMoreBtnClone.addEventListener("click", loadNextBatch);
-    container.after(loadMoreBtnClone);
+    // Replace the load-more handler (instead of adding a new one) so repeated
+    // renders don't stack listeners. current_shown_idx belongs to this render's
+    // closure, so the new handler always pages through the *current* `sorted`.
+    if (_loadMoreHandler) loadMoreBtnClone.removeEventListener("click", _loadMoreHandler);
+    _loadMoreHandler = loadNextBatch;
+    loadMoreBtnClone.addEventListener("click", _loadMoreHandler);
+
+    loadMoreBtnClone.style.display = "";
+
+    loadNextBatch(); // first batch
 }
 
 async function applyServerFilter(filter_mode, ascending = true) {
     const container = document.querySelector("#rbx-public-game-server-item-container");
     if (!container) return;
 
-    // Reset / default behaviour.
-    if (filter_mode === "default") {
-        // No region scoped → a true Roblox-default reset.
-        if (!_filterRegion) {
-            window.__filter_active__ = false;
-            window.__current_filter__ = "default";
-            window.server_list = originalServerList ?? [];
-            container.innerHTML = originalHTML;
-            loadMoreBtnClone?.remove();
-            loadMoreBtnClone = null;
-            document.querySelector(".rbx-public-running-games-footer")?.style.removeProperty("display");
-            originalHTML = null;
-            originalServerList = null;
-            return;
-        }
-        // Default sort + a selected region → show region-filtered list, unsorted.
-        window.__filter_active__ = true;
+    // Reset / default behaviour with NO region scoped → a true Roblox-default
+    // reset (restore the original list exactly as Roblox rendered it).
+    if (filter_mode === "default" && !_filterRegion) {
+        window.__filter_active__ = false;
         window.__current_filter__ = "default";
+        _activeFilterMode = "default";
+        _activeSortAscending = true;
+        window.server_list = originalServerList ?? [];
+        container.innerHTML = originalHTML;
+        loadMoreBtnClone?.remove();
+        loadMoreBtnClone = null;
+        _loadMoreHandler = null;
+        document.querySelector(".rbx-public-running-games-footer")?.style.removeProperty("display");
+        originalHTML = null;
+        originalServerList = null;
+        return;
     }
 
     // Track the active sort so the Region button can re-apply it with a new scope.
     _activeFilterMode = filter_mode;
     _activeSortAscending = ascending;
 
-    // Already showing this exact mode – don't re-run the (expensive) search.
+    // Already showing this exact mode with this exact region – don't re-run.
+    // (Region changes go through __reapplyServerFilter, which clears these flags
+    // first so the region re-render is never skipped.)
     if (window.__filter_active__ && window.__current_filter__ === filter_mode) return;
 
-    // Switching from another active mode: restore the baseline list first so
-    // the new render starts clean. originalHTML/originalServerList are kept so
-    // a later "default" still works.
-    if (window.__filter_active__) {
-        window.__filter_active__ = false;
-        container.innerHTML = originalHTML;
-        loadMoreBtnClone?.remove();
-        loadMoreBtnClone = null;
-        document.querySelector(".rbx-public-running-games-footer")?.style.removeProperty("display");
-        window.server_list = originalServerList ?? [];
+    // Snapshot the container baseline (Roblox default) the first time we ever
+    // render a filtered view, so a later "default" reset can restore it. MUST
+    // happen before we overwrite container.innerHTML with the spinner below.
+    if (!originalHTML) {
+        originalHTML = container.innerHTML;
+        originalServerList = [...window.server_list];
     }
-
-    window.__filter_active__ = true;
-    window.__current_filter__ = filter_mode;
 
     const pageGameId = parseInt(window.location.href.split("games/")[1].split("/")[0]);
 
+    // Fetch + geolocate everything EXACTLY ONCE. Both are cached in memory and
+    // shared, so selecting a region, picking a sort, or changing either reuses
+    // the already-loaded data instead of re-downloading or re-relocating every
+    // server. The inline spinner (see showServerFilterSpinner) gives the user
+    // feedback during this work.
     const dialogLabel = filter_mode === "performant"
         ? "Fetching servers by performance, please be patient..."
         : filter_mode === "ping_server"
@@ -277,52 +386,38 @@ async function applyServerFilter(filter_mode, ascending = true) {
         ? "Sorting servers by your ping, please be patient..."
         : "Filtering servers by region, please be patient...";
 
-    document.body.insertAdjacentHTML("beforeend", `
-    <div class="foundation-web-dialog-overlay padding-y-medium foundation-web-portal-zindex bg-common-backdrop">
-        <div role="dialog" class="relative radius-large bg-surface-100 stroke-none foundation-web-dialog-content shadow-transient-high download-dialog" data-size="Medium">
-            
-            <!-- Close button -->
-            <div class="absolute foundation-web-dialog-close-container">
-                <button type="button" class="foundation-web-close-affordance flex bg-none cursor-pointer bg-over-media-100 padding-small radius-circle stroke-none" aria-label="Close">
-                    <span class="icon icon-regular-x size-[var(--icon-size-medium)]"></span>
-                </button>
-            </div>
+    // Instant visual feedback: drop the spinner into the list right away so the
+    // click never looks like it did nothing while we fetch/geolocate (first
+    // time) or compute the (cached) sort. renderServerCards() clears it when the
+    // cards are ready. Declaration order matters here: dialogLabel is defined
+    // above so this lookup is safe.
+    const loadingLabel = _filterRegion
+        ? (filter_mode === "default" ? "Filtering servers by region, please be patient…"
+                                      : "Sorting filtered servers, please be patient…")
+        : dialogLabel;
+    const countEl = showServerFilterSpinner(container, loadingLabel);
 
-            <!-- Icon + Title -->
-            <div class="dialog-main-container padding-x-xlarge padding-top-xlarge padding-bottom-xlarge flex flex-col items-center gap-xlarge">
-                <img src="${chrome.runtime.getURL('assets/icons/cat128.png')}" class="app-icon-windows size-1600">
-                <h2 class="text-heading-small padding-x-xxlarge text-align-x-center">
-                    ${dialogLabel}
-                </h2>
-            </div>
-
-            <div class="dialog-button-container padding-x-xlarge padding-bottom-xlarge flex">
-                <button type="button" class="foundation-web-button cursor-pointer flex items-center justify-center radius-medium text-label-medium height-1000 padding-x-medium bg-action-emphasis content-action-emphasis grow stroke-none" style="background-color: #dfa834">
-                    <div aria-hidden="true" class="absolute flex"><svg class="foundation-web-loading-spinner" width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" fill="currentColor" d="M10 2.75C8.56609 2.75 7.16438 3.1752 5.97212 3.97185C4.77986 4.76849 3.85061 5.90078 3.30188 7.22554C2.75314 8.55031 2.60957 10.008 2.88931 11.4144C3.16905 12.8208 3.85955 14.1126 4.87348 15.1265C5.88741 16.1405 7.17924 16.831 8.5856 17.1107C9.99196 17.3904 11.4497 17.2469 12.7745 16.6981C14.0992 16.1494 15.2315 15.2201 16.0282 14.0279C16.8248 12.8356 17.25 11.4339 17.25 10C17.25 9.58579 17.5858 9.25 18 9.25C18.4142 9.25 18.75 9.58579 18.75 10C18.75 11.7306 18.2368 13.4223 17.2754 14.8612C16.3139 16.3002 14.9473 17.4217 13.3485 18.0839C11.7496 18.7462 9.9903 18.9195 8.29296 18.5819C6.59563 18.2443 5.03653 17.4109 3.81282 16.1872C2.58911 14.9635 1.75575 13.4044 1.41813 11.707C1.08051 10.0097 1.25379 8.25037 1.91606 6.65152C2.57832 5.05267 3.69983 3.6861 5.13876 2.72464C6.57769 1.76318 8.26942 1.25 10 1.25C10.4142 1.25 10.75 1.58579 10.75 2C10.75 2.41421 10.4142 2.75 10 2.75Z"></path></svg></div>
-                </button>
-            </div>
-
-        </div>
-    </div>
-    `)
-    const searchingDialog = document.querySelector(".foundation-web-dialog-overlay")
-
-    if (!originalHTML) {
-        originalHTML = container.innerHTML;
-        originalServerList = [...window.server_list];
-    }
+    // Disable "Load more" while loading (e.g. during the long client-ping
+    // geolocation sort) so the user can't page a stale previous list. It's
+    // re-enabled inside renderServerCards once the new cards are ready.
+    setLoadMoreDisabled(true);
 
     const data = await getAllServersCached(pageGameId)
     const all = data.server_list ?? [];
 
-    // If a region is scoped, geolocate the whole list first so we can read each
-    // server's country from locationCache.
-    if (_filterRegion) {
-        processServersLocationBatch(all, pageGameId);
-        await Promise.all(all.map(s => waitForLocation(s.id, 15000).catch(() => null)));
-    }
+    // Single geolocation pass over the whole list (cached after the first run).
+    // On the first (slow) pass, mirror the live "N/M" progress into the spinner
+    // so a long fetch+geolocate never looks frozen.
+    await geolocateAllServersOnce(pageGameId, ({ phase, done, total }) => {
+        if (countEl && total > 0) {
+            countEl.textContent = phase === "fetching"
+                ? " — fetching servers…"
+                : ` — ${done}/${total}`;
+        }
+    });
 
     // Candidate pool: all servers, or just those in the selected region.
+    // locationCache is already fully populated by geolocateAllServersOnce.
     let base = all;
     if (_filterRegion) {
         base = _filterRegion === "__unknown__"
@@ -332,10 +427,6 @@ async function applyServerFilter(filter_mode, ascending = true) {
 
     let sorted = [];
     if (filter_mode === "performant") {
-        // Geolocate the whole pool first (so client-ping cells can fill in)
-        // using the same 15s wait the other sort modes rely on.
-        processServersLocationBatch(base, pageGameId);
-        await Promise.all(base.map(s => waitForLocation(s.id, 15000).catch(() => null)));
         const seen = new Set();
         sorted = performantSort(base, ascending).filter(s => {
             if (seen.has(s.id)) return false;
@@ -343,9 +434,6 @@ async function applyServerFilter(filter_mode, ascending = true) {
             return true;
         });
     } else if (filter_mode === "ping_server") {
-        // Same pre-geolocation so client-ping estimates are available.
-        processServersLocationBatch(base, pageGameId);
-        await Promise.all(base.map(s => waitForLocation(s.id, 15000).catch(() => null)));
         sorted = serverPingSort(base, ascending);
     } else if (filter_mode === "ping_client") {
         sorted = await clientPingSort(base, ascending);
@@ -354,7 +442,8 @@ async function applyServerFilter(filter_mode, ascending = true) {
         sorted = base;
     }
 
-    searchingDialog.remove()
+    window.__filter_active__ = true;
+    window.__current_filter__ = filter_mode;
 
     await renderServerCards(sorted, pageGameId);
 }
@@ -389,17 +478,14 @@ if (window.location.href.includes("/games/")) {
         }
 
         filter_select.addEventListener("change", () => {
-            // Picking "Roblox Default" also drops any active region scope.
-            if (filter_select.value === "default" && _filterRegion) {
-                _filterRegion = null;
-                if (typeof setRegionButtonLabel === "function") setRegionButtonLabel(null);
-            }
-            // Manual dropdown change resets to "Best first" so the button label
-            // always matches the actual sort direction.
+            // NOTE: changing the sort mode intentionally does NOT touch the
+            // active region scope — region and sort are independent filters
+            // that always compose (see _filterRegion in applyServerFilter).
             sortAscending = true;
             sort_order_btn.textContent = "Best first";
             updateSortOrderVisibility();
-            applyServerFilter(filter_select.value);
+            // Pass the current direction so the sort actually honours it.
+            applyServerFilter(filter_select.value, sortAscending);
         });
 
         // Re-apply the current sort with the flipped direction.
@@ -410,7 +496,8 @@ if (window.location.href.includes("/games/")) {
             // Force a re-render (the "same mode" guard would otherwise skip it).
             window.__filter_active__ = false;
             window.__current_filter__ = null;
-            applyServerFilter(filter_select.value);
+            // Pass the (now flipped) direction so the sort actually reverses.
+            applyServerFilter(filter_select.value, sortAscending);
         });
 
         sort_order_btn.textContent = "Best first";

@@ -29,14 +29,15 @@ let regionDropdownEl = null;
 
 // Build { continent: { countryCode: { name, count } } } from the (already
 // geolocated) full server list for the current game.
-async function buildRegionTree(pageGameId) {
+async function buildRegionTree(pageGameId, onProgress) {
     const data = await getAllServersCached(pageGameId);
     const all = data.server_list ?? [];
 
-    // Kick off geolocation for the whole list, then wait for each server's
-    // country to resolve (or time out).
-    processServersLocationBatch(all, pageGameId);
-    await Promise.all(all.map(s => waitForLocation(s.id, 15000).catch(() => null)));
+    // Single geolocation pass over the whole list (cached after the first run,
+    // shared with the sort filters in server_filter.js). Subsequent region
+    // opens reuse the already-placed servers instead of re-locating everything.
+    // onProgress (first open only) feeds the live "Loading regions… N/M" text.
+    await geolocateAllServersOnce(pageGameId, onProgress);
 
     const tree = {};
     let unknownCount = 0;
@@ -253,7 +254,16 @@ if (window.location.href.includes("/games/")) {
 
             try {
                 const pageGameId = parseInt(window.location.href.split("games/")[1].split("/")[0]);
-                const tree = await buildRegionTree(pageGameId);
+
+                // Show live progress while we fetch + geolocate every server for
+                // the first time, so the button doesn't look frozen on big games.
+                // If the data is already cached, buildRegionTree resolves fast and
+                // the text is only ever "Loading regions…" for a split second.
+                const tree = await buildRegionTree(pageGameId, ({ phase, done, total }) => {
+                    btn.textContent = phase === "fetching"
+                        ? "Loading regions…"
+                        : `Loading regions… ${done}/${total}`;
+                });
                 btn.textContent = originalText;
                 btn.disabled = false;
 
@@ -278,24 +288,9 @@ if (window.location.href.includes("/games/")) {
         });
     });
 
-    // Keep the region button in sync if the other filter dropdown is used.
-    const syncSelect = () => {
-        const sel = document.querySelector("#filter-select");
-        if (!sel) {
-            observeElement("#filter-select", (s) => {
-                s.addEventListener("change", () => {
-                    currentRegionCode = null;
-                    setRegionButtonLabel(null);
-                    if (typeof window.__setFilterRegion === "function") window.__setFilterRegion(null);
-                });
-            });
-            return;
-        }
-        sel.addEventListener("change", () => {
-            currentRegionCode = null;
-            setRegionButtonLabel(null);
-            if (typeof window.__setFilterRegion === "function") window.__setFilterRegion(null);
-        });
-    };
-    syncSelect();
+    // NOTE: The region filter and the sort filter are deliberately INDEPENDENT.
+    // Selecting a sort no longer wipes the active region (and vice-versa), so the
+    // two always compose. We therefore intentionally do NOT listen for sort
+    // changes here — the region button label is only changed by the user picking
+    // a region from the dropdown below.
 }

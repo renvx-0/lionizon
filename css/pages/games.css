@@ -218,6 +218,41 @@
   }
 }
 
+/* --------------------------- Filter loading spinner -------------------------
+   Shown inside the server list while a filter/region re-render is being
+   computed (the usually-brief re-sorts that happen after the first heavy
+   fetch+geolocation). Keeps the user from thinking a click did nothing. */
+.server-filter-inline-spinner {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 64px 0;
+    color: var(--color-content-emphasis);
+    font-size: 14px;
+    pointer-events: none;
+}
+
+.server-filter-inline-spinner svg {
+    width: 28px;
+    height: 28px;
+    animation: lionizon-spin 0.8s linear infinite;
+}
+
+/* Live "N/M" progress count shown next to the spinner text while the first
+   server fetch + geolocation is happening. Dimmed slightly so it reads as a
+   sub-label of the main status line. */
+.server-filter-spinner-count {
+    opacity: 0.7;
+    font-variant-numeric: tabular-nums;
+}
+
+@keyframes lionizon-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+}
+
 /* ----------------------------- Region dropdown ----------------------------- */
 #region-filter-btn {
     color: var(--color-content-emphasis) !important;
