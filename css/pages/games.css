@@ -133,18 +133,32 @@
 
 .horizontal-pill {
     display: flex !important;
+    align-items: center !important;
+    flex-shrink: 0 !important;
+    white-space: nowrap !important;
     gap: 5px;
     background-color: var(--color-over-media-100);
     border-radius: 15px;
-    padding: 0px 9px 0px 9px !important;
+    padding: 2px 9px 2px 9px !important;
 }
 
 .horizontal-pill p {
-    font-size: 12px !important;
+    font-size: 11px !important;
+    white-space: nowrap !important;
+    margin: 0 !important;
 }
 
 .horizontal-pill svg {
     width: 15px !important;
+    height: auto !important;
+    display: block !important;
+    flex-shrink: 0 !important;
+}
+
+/* let the pill row wrap to a new line if the card is too narrow,
+   instead of squishing the pills (which caused the "fps" text to wrap) */
+.info-wrapper > div:first-child {
+    flex-wrap: wrap !important;
 }
 
 /*
@@ -160,7 +174,7 @@
     color: var(--color-content-emphasis) !important
 }
 
-.location-flag-container img, 
+.location-flag-container img,
 .location-flag-container svg {
     width: 20px;
     height: 20px;
@@ -310,4 +324,39 @@
     padding: 12px 10px;
     opacity: 0.6;
     text-align: center;
+}
+
+/* ----------------------------- Ping status border ---------------------------
+   Applied to a public-server card when at least one ping is known. The border
+   ring is drawn with a pseudo-element so the card keeps its rounded corners
+   (border-image would square them off). Colors come from the inline CSS vars
+   --ping-border-server / --ping-border-client, set per-card from JS:
+   - both pings known → left half server color, right half client color, with a
+     soft gradient merge at the midline
+   - only one known     → that color on both halves (looks solid)
+   - neither            → class not added, no border. */
+.card-item-public-server.ping-border {
+    position: relative !important;
+}
+
+.card-item-public-server.ping-border::before {
+    content: "" !important;
+    position: absolute !important;
+    inset: 0 !important;
+    border-radius: inherit !important;
+    padding: 1px !important;
+    background: linear-gradient(
+        to right,
+        var(--ping-border-server, transparent) 0%,
+        var(--ping-border-server, transparent) 45%,
+        var(--ping-border-client, transparent) 55%,
+        var(--ping-border-client, transparent) 100%
+    ) !important;
+    -webkit-mask:
+        linear-gradient(#fff 0 0) content-box,
+        linear-gradient(#fff 0 0) !important;
+    -webkit-mask-composite: xor !important;
+            mask-composite: exclude !important;
+    opacity: 0.55 !important;
+    pointer-events: none !important;
 }

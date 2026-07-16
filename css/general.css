@@ -31,3 +31,15 @@
 .game-card-friend-info.game-card-info {
     margin-top: 5px !important;
 }
+
+.flex {
+    display: flex;
+}
+
+.items-center {
+    align-items: center;
+}
+
+.justify-center {
+    justify-content: center !important;
+}

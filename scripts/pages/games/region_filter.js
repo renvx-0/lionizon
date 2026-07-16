@@ -260,7 +260,15 @@ if (window.location.href.includes("/games/")) {
                 showRegionDropdown(btn, tree, (code) => {
                     currentRegionCode = code;
                     setRegionButtonLabel(code);
-                    applyServerFilter(code ? `region:${code}` : "default");
+                    // Scope the current sort to this region (or clear the scope
+                    // when "All regions" is chosen) and re-apply. Falls back to
+                    // the legacy region mode if the sort helper isn't present.
+                    if (typeof window.__setFilterRegion === "function") {
+                        window.__setFilterRegion(code);
+                        window.__reapplyServerFilter();
+                    } else {
+                        applyServerFilter(code ? `region:${code}` : "default");
+                    }
                 });
             } catch (err) {
                 console.error("Region fetch failed", err);
@@ -278,6 +286,7 @@ if (window.location.href.includes("/games/")) {
                 s.addEventListener("change", () => {
                     currentRegionCode = null;
                     setRegionButtonLabel(null);
+                    if (typeof window.__setFilterRegion === "function") window.__setFilterRegion(null);
                 });
             });
             return;
@@ -285,6 +294,7 @@ if (window.location.href.includes("/games/")) {
         sel.addEventListener("change", () => {
             currentRegionCode = null;
             setRegionButtonLabel(null);
+            if (typeof window.__setFilterRegion === "function") window.__setFilterRegion(null);
         });
     };
     syncSelect();

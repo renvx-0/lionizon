@@ -44,7 +44,10 @@ function waitForLocation(serverId, timeout = 5000) {
 
         setTimeout(() => {
             if (!locationCache.hasOwnProperty(serverId)) {
-                resolveLocation(serverId, null);
+                // Resolve as "not found" WITHOUT poisoning the cache, so a later
+                // geolocation (e.g. a filter re-render) can still populate it.
+                locationResolvers[serverId]?.forEach(r => r(null));
+                delete locationResolvers[serverId];
             }
         }, timeout);
     });
@@ -85,7 +88,59 @@ async function getIPLocation(datacenters, placeId) {
     } catch (e) {
         console.error("IP lookup failed", e);
     }
-} 
+}
+
+// Great-circle (haversine) distance in km between two lat/long points.
+function haversineKm(lat1, lon1, lat2, lon2) {
+    const R = 6371; // Earth radius in km
+    const toRad = (deg) => (deg * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Rough RTT estimate from physical distance. Light in fiber travels ~200 km/ms
+// one-way, so a round trip is ~distance/100 ms, plus a fixed processing/router
+// overhead. This is an estimate, not a real ICMP measurement.
+function estimatePing(clientLat, clientLon, serverLat, serverLon) {
+    const distanceKm = haversineKm(clientLat, clientLon, serverLat, serverLon);
+    return Math.max(1, Math.round(distanceKm / 100 + 20));
+}
+
+// Resolve the client's own lat/long. Rather than fetching the IP from a
+// third-party service (which Roblox's CSP can block), we hit our own worker's
+// /me endpoint — Cloudflare gives it the caller's IP, and we geolocate that
+// through the same bucket the servers use. Cached so it only runs once per page.
+const __timeout = (promise, ms, label) =>
+    Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout: ${label}`)), ms)),
+    ]);
+
+let __clientLocationPromise = null;
+function getClientLocation() {
+    if (__clientLocationPromise) return __clientLocationPromise;
+    __clientLocationPromise = (async () => {
+        try {
+            const res = await __timeout(
+                fetch(`${IP_API_URL}/me`, { headers: { Origin: "https://www.roblox.com/" } }),
+                8000,
+                "client /me"
+            );
+            const data = await res.json();
+            if (data && data.latitude != null && data.longitude != null) {
+                return { latitude: data.latitude, longitude: data.longitude };
+            }
+        } catch (e) {
+            console.error("Client location lookup failed", e);
+        }
+        return null;
+    })();
+    return __clientLocationPromise;
+}
 
 async function processServersLocationBatch(serversInRequest, gameId) {
     const serverIds = serversInRequest.map(s => s.id);
@@ -108,8 +163,11 @@ async function processServersLocationBatch(serversInRequest, gameId) {
         // if its in cache then skip
         if (locationCache[id]) continue;
 
-        // if its in storage then resolve with that saved data
-        if (geo_db.servers[id]) {
+        // if its in storage then resolve with that saved data — but only trust it
+        // if it carries coordinates (older cached entries predate the lat/long
+        // fields and would break the client-ping estimate). Otherwise fall
+        // through to a fresh lookup.
+        if (geo_db.servers[id] && geo_db.servers[id].latitude != null && geo_db.servers[id].longitude != null) {
             resolveLocation(id, geo_db.servers[id]);
             continue;
         }
@@ -124,8 +182,8 @@ async function processServersLocationBatch(serversInRequest, gameId) {
         const dc = String(joinScript.DataCenterId);
         if (!ip || !dc) continue;
 
-        // check if ip exists
-        if (geo_db.addresses[ip]) {
+        // check if ip exists — but only trust it if it has coordinates.
+        if (geo_db.addresses[ip] && geo_db.addresses[ip].latitude != null && geo_db.addresses[ip].longitude != null) {
             const data = { ip, ...geo_db.addresses[ip] };
             geo_db.servers[id] = data;
             resolveLocation(id, data);
@@ -193,6 +251,12 @@ async function processServersLocationBatch(serversInRequest, gameId) {
 if (window.location.href.includes("/games/")) { 
     const pageGameId = parseInt(window.location.href.split("games/")[1].split("/")[0])
     log(`User loaded game ${pageGameId}`)
+
+    // Warm up the client's own location early (cached, requested only once). This
+    // makes /me fire as soon as the page loads so client-ping cells can be filled
+    // the moment each server's coordinates arrive — independent of any server's
+    // geolocation success.
+    getClientLocation();
 
     /* --------------------------- Server geolocation --------------------------- */
 
@@ -476,6 +540,23 @@ if (window.location.href.includes("/games/")) {
         });
     }
 
+    // Build the gradient border around a public-server card based on which
+    // ping(s) are known:
+    //   - both server + client ping → left half server color, right half client
+    //     color, merged by a soft gradient at the midline
+    //   - only one of them           → that color used fully (no gradient needed)
+    //   - neither                    → no border is added
+    // Colors come from the ping-status palette already used for the pills. The
+    // element is expected to carry the `card-item-public-server` class.
+    function updatePingBorder(cardEl, serverColor, clientColor) {
+        if (!cardEl) return;
+        if (!serverColor && !clientColor) return; // nothing to draw
+
+        cardEl.style.setProperty("--ping-border-server", serverColor || clientColor);
+        cardEl.style.setProperty("--ping-border-client", clientColor || serverColor);
+        cardEl.classList.add("ping-border");
+    }
+
     // when server element appears
     window.handleServerElement = async function(el) {
         log("Server element added/changed:", el);
@@ -500,6 +581,7 @@ if (window.location.href.includes("/games/")) {
         let serverInfo = await waitForServerId(shortServerId)
         const serverId = serverInfo["id"]
         const serverPing = serverInfo["ping"] || 80
+        const serverPingColor = getPingStatus(serverPing).color;
         const serverFps = serverInfo["fps"]
 
         function getPingStatus(ping) {
@@ -518,10 +600,14 @@ if (window.location.href.includes("/games/")) {
             infoWrapper = document.createElement("div")
             infoWrapper.classList.add("info-wrapper")
             infoWrapper.innerHTML = `
-            <div class="flex items-center" style="gap:5px; margin-bottom:10px !important">
-                <div class="horizontal-pill flex items-center" style="gap:5px">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="24" style="flex-shrink:0" viewBox="0 0 24 24" fill="none" stroke="${getPingStatus(serverPing).color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-globe-icon lucide-globe"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+            <div class="flex items-center justify-center" style="gap:5px; margin-bottom:10px !important">
+                <div class="horizontal-pill flex items-center" style="gap:5px" title="Server ping">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="${getPingStatus(serverPing).color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-server-icon lucide-server"><rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/></svg>
                     <p class="server-ping" style="color: ${getPingStatus(serverPing).color} !important">${serverPing}ms</p>
+                </div>
+                <div class="horizontal-pill flex items-center" style="gap:5px" title="Your ping to this server">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="24" style="flex-shrink:0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-laptop-minimal-icon lucide-laptop-minimal"><rect width="18" height="12" x="3" y="4" rx="2" ry="2"/><line x1="2" x2="22" y1="20" y2="20"/></svg>
+                    <p class="client-ping">-</p>
                 </div>
                 <div class="horizontal-pill flex items-center" style="gap:5px">
                     <svg xmlns="http://www.w3.org/2000/svg" width="20" height="24" style="flex-shrink:0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-gauge-icon lucide-gauge"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>
@@ -559,6 +645,43 @@ if (window.location.href.includes("/games/")) {
         } catch (e) {
             serverLocEl.textContent = "Full server";
         }
+
+        // Client ping: distance between client and server lat/long. The client
+        // location (/me) is fetched UNCONDITIONALLY here — it's cached so it only
+        // hits the network once — and we only compute the number once the server's
+        // coordinates are also known. This guarantees /me is always requested even
+        // if a server can't be geolocated.
+        // Holds the resolved client-ping color (null when the ping couldn't be
+        // computed, e.g. client/server geolocation unavailable).
+        let clientPingColor = null;
+        const clientPingWrapper = infoWrapper.querySelector(".client-ping").parentElement;
+        const clientPingText = clientPingWrapper.querySelector(".client-ping");
+        const clientPingSvg = clientPingWrapper.querySelector("svg");
+        const serverLocation = locationCache[serverId];
+        if (clientPingWrapper) {
+            try {
+                const clientLoc = await getClientLocation();
+                if (clientLoc && serverLocation && serverLocation.latitude != null && serverLocation.longitude != null) {
+                    const clientPing = estimatePing(clientLoc.latitude, clientLoc.longitude, serverLocation.latitude, serverLocation.longitude);
+                    const status = getPingStatus(clientPing);
+                    clientPingColor = status.color;
+
+                    clientPingText.textContent = `≈ ${clientPing}ms`;
+                    clientPingText.style.setProperty("color", status.color, "important");
+                    clientPingSvg.setAttribute("stroke", status.color);
+                } else {
+                    clientPingText.textContent = "-";
+                }
+            } catch (e) {
+                clientPingText.textContent = "-";
+            }
+        }
+
+        // Both pings are now settled (server known from the start, client either
+        // resolved or left null). Add the gradient border around the public-server
+        // card: half server color + half client color when both exist, or the
+        // single known color if only one does. If neither exists, no border.
+        updatePingBorder(el, serverPingColor, clientPingColor);
     }
 
     observeElement("#rbx-public-game-server-item-container", (container) => {

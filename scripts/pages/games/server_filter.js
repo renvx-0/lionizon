@@ -1,4 +1,4 @@
-function performantSort(servers, ascending = false) {
+function performantSort(servers, ascending = true) {
     const valid = servers.filter(s => s.fps != null && s.ping != null && !isNaN(s.fps) && !isNaN(s.ping));
 
     const maxFps  = valid.reduce((max, s) => Math.max(max, s.fps), -Infinity);
@@ -13,22 +13,109 @@ function performantSort(servers, ascending = false) {
         return (fpsScore + pingScore) / 2;
     };
 
-    return [...valid].sort((a, b) => ascending ? score(a) - score(b) : score(b) - score(a));
+    // Higher score = better, so "ascending" (Best first) must sort the highest
+    // score to the top — i.e. descending by score.
+    return [...valid].sort((a, b) => ascending ? score(b) - score(a) : score(a) - score(b));
+}
+
+// Sort by Roblox's own reported server ping (the value already on each server).
+function serverPingSort(servers, ascending = true) {
+    const valid = servers.filter(s => s.ping != null && !isNaN(s.ping));
+    // ascending = best (lowest ping) first.
+    const dir = ascending ? 1 : -1;
+    return [...valid].sort((a, b) => dir * (a.ping - b.ping));
+}
+
+// Sort by the *estimated* client→server ping (distance-based), computed the
+// same way the per-card client-ping cell is. Requires every server to be
+// geolocated, plus the client's own location (fetched once via getClientLocation).
+async function clientPingSort(servers, ascending = true) {
+    const pageGameId = parseInt(window.location.href.split("games/")[1].split("/")[0]);
+
+    // Make sure every server is geolocated and the client location is known.
+    processServersLocationBatch(servers, pageGameId);
+    const clientLoc = await getClientLocation();
+    await Promise.all(servers.map(s => waitForLocation(s.id, 15000).catch(() => null)));
+
+    const valid = servers.filter(s => {
+        const loc = locationCache[s.id];
+        return clientLoc && loc && loc.latitude != null && loc.longitude != null;
+    });
+
+    const withPing = valid.map(s => {
+        const loc = locationCache[s.id];
+        return { s, est: estimatePing(clientLoc.latitude, clientLoc.longitude, loc.latitude, loc.longitude) };
+    });
+
+    // ascending = best (lowest estimated ping) first.
+    const dir = ascending ? 1 : -1;
+    return withPing
+        .sort((a, b) => dir * (a.est - b.est))
+        .map(x => x.s);
 }
 
 let originalHTML = null;
 let originalServerList = null;
 let loadMoreBtnClone = null;
 
+// --- Filter composition state -----------------------------------------------
+// The sort mode (performant / ping_server / ping_client / default) and an
+// optional region scope compose: the chosen sort runs over the servers in the
+// selected region only. Region comes from the Region button (region_filter.js);
+// it calls the window helpers below to set scope + re-apply the current sort.
+let _filterRegion = null;          // country code, "__unknown__", or null
+let _activeFilterMode = "default";
+let _activeSortAscending = true;
+
+// Set by the Region button; null clears the scope.
+window.__setFilterRegion = (code) => { _filterRegion = code; };
+// Re-apply the current sort (respecting region scope). Forces a re-render even
+// if the sort mode itself didn't change (e.g. only the region changed).
+window.__reapplyServerFilter = () => {
+    window.__filter_active__ = false;
+    window.__current_filter__ = null;
+    applyServerFilter(_activeFilterMode, _activeSortAscending);
+};
+
 // Cache the expensive "all servers" fetch per game page so the performant
 // filter and the region selector don't each re-download the entire list.
+//
+// Before this fix, only an in-memory variable was kept, but applyServerFilter()
+// cleared it back to null on every mode switch (default / performant / ping_*),
+// so each filter change re-fetched the full server list. The cache is now kept
+// in chrome.storage keyed by placeId, so it survives filter changes AND SPA
+// navigations to other games (the script re-runs per /games/ load), and is only
+// refreshed when it's missing or belongs to a different game.
+const _serverCacheKey = "ext_server_cache";
 let _cachedServers = null;
 let _cachedServersGameId = null;
 
+// Load the persisted cache (or start empty). Seeded once at module load.
+const __serverCachePromise = loadData(_serverCacheKey, {}).then(
+    data => { _serverCache = data; return data; }
+);
+let _serverCache = {};
+
 async function getAllServersCached(pageGameId) {
+    // In-memory hit for this page load.
     if (_cachedServers && _cachedServersGameId === pageGameId) return _cachedServers;
+
+    // Persistent hit (survives filter changes + SPA nav to the same game).
+    await __serverCachePromise;
+    const stored = _serverCache[pageGameId];
+    if (Array.isArray(stored?.server_list) && stored.server_list.length > 0) {
+        _cachedServers = stored;
+        _cachedServersGameId = pageGameId;
+        return _cachedServers;
+    }
+
+    // Otherwise fetch from the API (only once) and persist it.
     _cachedServers = await getAllServers(pageGameId);
     _cachedServersGameId = pageGameId;
+
+    _serverCache[pageGameId] = _cachedServers;
+    saveData({ [_serverCacheKey]: _serverCache });
+
     return _cachedServers;
 }
 
@@ -134,23 +221,33 @@ async function renderServerCards(sorted, pageGameId) {
     container.after(loadMoreBtnClone);
 }
 
-async function applyServerFilter(filter_mode) {
+async function applyServerFilter(filter_mode, ascending = true) {
     const container = document.querySelector("#rbx-public-game-server-item-container");
     if (!container) return;
 
-    // Reset to Roblox's default behaviour.
+    // Reset / default behaviour.
     if (filter_mode === "default") {
-        window.__filter_active__ = false;
+        // No region scoped → a true Roblox-default reset.
+        if (!_filterRegion) {
+            window.__filter_active__ = false;
+            window.__current_filter__ = "default";
+            window.server_list = originalServerList ?? [];
+            container.innerHTML = originalHTML;
+            loadMoreBtnClone?.remove();
+            loadMoreBtnClone = null;
+            document.querySelector(".rbx-public-running-games-footer")?.style.removeProperty("display");
+            originalHTML = null;
+            originalServerList = null;
+            return;
+        }
+        // Default sort + a selected region → show region-filtered list, unsorted.
+        window.__filter_active__ = true;
         window.__current_filter__ = "default";
-        window.server_list = originalServerList ?? [];
-        container.innerHTML = originalHTML;
-        loadMoreBtnClone?.remove();
-        loadMoreBtnClone = null;
-        document.querySelector(".rbx-public-running-games-footer")?.style.removeProperty("display");
-        originalHTML = null;
-        originalServerList = null;
-        return;
     }
+
+    // Track the active sort so the Region button can re-apply it with a new scope.
+    _activeFilterMode = filter_mode;
+    _activeSortAscending = ascending;
 
     // Already showing this exact mode – don't re-run the (expensive) search.
     if (window.__filter_active__ && window.__current_filter__ === filter_mode) return;
@@ -174,6 +271,10 @@ async function applyServerFilter(filter_mode) {
 
     const dialogLabel = filter_mode === "performant"
         ? "Fetching servers by performance, please be patient..."
+        : filter_mode === "ping_server"
+        ? "Sorting servers by server ping, please be patient..."
+        : filter_mode === "ping_client"
+        ? "Sorting servers by your ping, please be patient..."
         : "Filtering servers by region, please be patient...";
 
     document.body.insertAdjacentHTML("beforeend", `
@@ -212,26 +313,45 @@ async function applyServerFilter(filter_mode) {
     }
 
     const data = await getAllServersCached(pageGameId)
+    const all = data.server_list ?? [];
+
+    // If a region is scoped, geolocate the whole list first so we can read each
+    // server's country from locationCache.
+    if (_filterRegion) {
+        processServersLocationBatch(all, pageGameId);
+        await Promise.all(all.map(s => waitForLocation(s.id, 15000).catch(() => null)));
+    }
+
+    // Candidate pool: all servers, or just those in the selected region.
+    let base = all;
+    if (_filterRegion) {
+        base = _filterRegion === "__unknown__"
+            ? all.filter(s => !locationCache[s.id] || !locationCache[s.id].country)
+            : all.filter(s => locationCache[s.id]?.country === _filterRegion);
+    }
 
     let sorted = [];
     if (filter_mode === "performant") {
+        // Geolocate the whole pool first (so client-ping cells can fill in)
+        // using the same 15s wait the other sort modes rely on.
+        processServersLocationBatch(base, pageGameId);
+        await Promise.all(base.map(s => waitForLocation(s.id, 15000).catch(() => null)));
         const seen = new Set();
-        sorted = performantSort(data.server_list ?? []).filter(s => {
+        sorted = performantSort(base, ascending).filter(s => {
             if (seen.has(s.id)) return false;
             seen.add(s.id);
             return true;
         });
-    } else if (filter_mode.startsWith("region:")) {
-        const raw = filter_mode.split(":")[1];
-        const all = data.server_list ?? [];
-        // Make sure every server is geolocated before we can read its country.
-        processServersLocationBatch(all, pageGameId);
-        await Promise.all(all.map(s => waitForLocation(s.id, 15000).catch(() => null)));
-        if (raw === "__unknown__") {
-            sorted = all.filter(s => !locationCache[s.id] || !locationCache[s.id].country);
-        } else {
-            sorted = all.filter(s => locationCache[s.id]?.country === raw);
-        }
+    } else if (filter_mode === "ping_server") {
+        // Same pre-geolocation so client-ping estimates are available.
+        processServersLocationBatch(base, pageGameId);
+        await Promise.all(base.map(s => waitForLocation(s.id, 15000).catch(() => null)));
+        sorted = serverPingSort(base, ascending);
+    } else if (filter_mode === "ping_client") {
+        sorted = await clientPingSort(base, ascending);
+    } else {
+        // "default" (optionally region-scoped) → no extra sort applied.
+        sorted = base;
     }
 
     searchingDialog.remove()
@@ -245,15 +365,55 @@ if (window.location.href.includes("/games/")) {
         <div class="rbx-select-group select-group">
             <select id="filter-select" class="input-field rbx-select select-option" style="margin-left:20px">
                 <option value="default">Roblox Default</option>
-                <option value="performant">Most performant</option>
+                <optgroup label="Sort by ping">
+                    <option value="performant">Most performant</option>
+                    <option value="ping_server">Server ping</option>
+                    <option value="ping_client">Client ping</option>
+                </optgroup>
             </select>
             <span class="icon-arrow icon-down-16x16"></span>
         </div>
+        <button id="sort-order-btn" type="button" class="btn-control-xs btn-secondary-md" style="margin-left:10px; display:none" title="Toggle sort direction">Best first</button>
         `)
 
         const filter_select = el.querySelector("div #filter-select")
+        const sort_order_btn = el.querySelector("#sort-order-btn")
+
+        // true = lowest ping / highest performance first ("Best first").
+        let sortAscending = true;
+
+        const SORT_MODES = new Set(["performant", "ping_server", "ping_client"]);
+
+        function updateSortOrderVisibility() {
+            sort_order_btn.style.display = SORT_MODES.has(filter_select.value) ? "" : "none";
+        }
+
         filter_select.addEventListener("change", () => {
+            // Picking "Roblox Default" also drops any active region scope.
+            if (filter_select.value === "default" && _filterRegion) {
+                _filterRegion = null;
+                if (typeof setRegionButtonLabel === "function") setRegionButtonLabel(null);
+            }
+            // Manual dropdown change resets to "Best first" so the button label
+            // always matches the actual sort direction.
+            sortAscending = true;
+            sort_order_btn.textContent = "Best first";
+            updateSortOrderVisibility();
             applyServerFilter(filter_select.value);
         });
+
+        // Re-apply the current sort with the flipped direction.
+        sort_order_btn.addEventListener("click", () => {
+            if (!SORT_MODES.has(filter_select.value)) return;
+            sortAscending = !sortAscending;
+            sort_order_btn.textContent = sortAscending ? "Best first" : "Worst first";
+            // Force a re-render (the "same mode" guard would otherwise skip it).
+            window.__filter_active__ = false;
+            window.__current_filter__ = null;
+            applyServerFilter(filter_select.value);
+        });
+
+        sort_order_btn.textContent = "Best first";
+        updateSortOrderVisibility();
     })
 }
